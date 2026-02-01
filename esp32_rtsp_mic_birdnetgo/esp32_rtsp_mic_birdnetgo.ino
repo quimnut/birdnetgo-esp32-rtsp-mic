@@ -6,8 +6,58 @@
 #include <math.h>
 #include "WebUI.h"
 
+// ================== PLATFORM DETECTION ==================
+// Automatically detect ESP32 variant and configure pins accordingly
+#if CONFIG_IDF_TARGET_ESP32C6
+    #define PLATFORM_NAME "ESP32-C6"
+    #define HAS_RF_SWITCH 1
+    // Seeed XIAO ESP32-C6 pin configuration
+    #define I2S_BCLK_PIN    21  // Bit clock
+    #define I2S_LRCLK_PIN   1   // Word select (LRCLK)
+    #define I2S_DOUT_PIN    2   // Data from mic
+    #define I2S_DMA_BUF_COUNT 8
+#elif CONFIG_IDF_TARGET_ESP32S3
+    #define PLATFORM_NAME "ESP32-S3"
+    #define HAS_RF_SWITCH 0
+    // ESP32-S3 DevKitC / XIAO S3 - safe pins avoiding PSRAM/USB conflicts
+    #define I2S_BCLK_PIN    16  // Bit clock
+    #define I2S_LRCLK_PIN   17  // Word select (LRCLK)
+    #define I2S_DOUT_PIN    18  // Data from mic
+    #define I2S_DMA_BUF_COUNT 8
+#elif CONFIG_IDF_TARGET_ESP32
+    #define PLATFORM_NAME "ESP32"
+    #define HAS_RF_SWITCH 0
+    // Classic ESP32 (WROOM-32, DevKitC, NodeMCU-32S) - avoid UART0/strapping pins
+    #define I2S_BCLK_PIN    26  // Bit clock (DAC2, safe)
+    #define I2S_LRCLK_PIN   25  // Word select (DAC1, safe)
+    #define I2S_DOUT_PIN    22  // Data from mic (I2C SCL if unused)
+    #define I2S_DMA_BUF_COUNT 12  // Extra buffering for WiFi coexistence
+#else
+    #warning "Unknown ESP32 variant - using default pins, please verify"
+    #define PLATFORM_NAME "ESP32-Unknown"
+    #define HAS_RF_SWITCH 0
+    #define I2S_BCLK_PIN    26
+    #define I2S_LRCLK_PIN   25
+    #define I2S_DOUT_PIN    22
+    #define I2S_DMA_BUF_COUNT 8
+#endif
+
+// ================== MICROPHONE TYPE ====================
+// MIC_TYPE_PDM: Built-in PDM microphone (e.g., XIAO ESP32-S3 Sense)
+// MIC_TYPE_I2S_STANDARD: External I2S microphone (ICS-43434, INMP441)
+// Set via build flag -D MIC_TYPE_PDM or defaults to I2S
+#if defined(MIC_TYPE_PDM)
+    #define MIC_NAME "PDM"
+    // XIAO ESP32-S3 Sense built-in PDM microphone pins
+    #define PDM_CLK_PIN   42
+    #define PDM_DATA_PIN  41
+#else
+    #define MIC_TYPE_I2S_STANDARD
+    #define MIC_NAME "I2S"
+#endif
+
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "1.3.0"
+#define FW_VERSION "1.5.0"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 
@@ -32,11 +82,6 @@ const char* FW_VERSION_STR = FW_VERSION;
 #define OVERHEAT_MIN_LIMIT_C 30
 #define OVERHEAT_MAX_LIMIT_C 95
 #define OVERHEAT_LIMIT_STEP_C 5
-
-// -- Pins
-#define I2S_BCLK_PIN    21
-#define I2S_LRCLK_PIN   1
-#define I2S_DOUT_PIN    2
 
 // -- Servers
 WiFiServer rtspServer(8554);
@@ -442,6 +487,15 @@ void loadAudioSettings() {
     }
     // Log the configured TX dBm (not the current enum), snapped for clarity
     float txShown = wifiPowerLevelToDbm(pickWifiPowerLevel(wifiTxPowerDbm));
+#if defined(MIC_TYPE_PDM)
+    // PDM mode: no shift bits
+    simplePrintln("Loaded settings: Rate=" + String(currentSampleRate) +
+                  ", Gain=" + String(currentGainFactor, 1) +
+                  ", Buffer=" + String(currentBufferSize) +
+                  ", WiFiTX=" + String(txShown, 1) + "dBm" +
+                  ", HPF=" + String(highpassEnabled?"on":"off") +
+                  ", HPFcut=" + String(highpassCutoffHz) + "Hz");
+#else
     simplePrintln("Loaded settings: Rate=" + String(currentSampleRate) +
                   ", Gain=" + String(currentGainFactor, 1) +
                   ", Buffer=" + String(currentBufferSize) +
@@ -449,6 +503,7 @@ void loadAudioSettings() {
                   ", shiftBits=" + String(i2sShiftBits) +
                   ", HPF=" + String(highpassEnabled?"on":"off") +
                   ", HPFcut=" + String(highpassCutoffHz) + "Hz");
+#endif
 }
 
 // Save settings to flash
@@ -546,6 +601,17 @@ void restartI2S() {
     simplePrintln("Restarting I2S with new parameters...");
     isStreaming = false;
 
+#if defined(MIC_TYPE_PDM)
+    // PDM mode: only 16-bit buffer needed
+    if (i2s_16bit_buffer) { free(i2s_16bit_buffer); i2s_16bit_buffer = nullptr; }
+
+    i2s_16bit_buffer = (int16_t*)malloc(currentBufferSize * sizeof(int16_t));
+    if (!i2s_16bit_buffer) {
+        simplePrintln("FATAL: Memory allocation failed after parameter change!");
+        ESP.restart();
+    }
+#else
+    // Standard I2S: both 32-bit and 16-bit buffers
     if (i2s_32bit_buffer) { free(i2s_32bit_buffer); i2s_32bit_buffer = nullptr; }
     if (i2s_16bit_buffer) { free(i2s_16bit_buffer); i2s_16bit_buffer = nullptr; }
 
@@ -555,6 +621,7 @@ void restartI2S() {
         simplePrintln("FATAL: Memory allocation failed after parameter change!");
         ESP.restart();
     }
+#endif
 
     setup_i2s_driver();
     // Refresh HPF with current parameters
@@ -589,6 +656,35 @@ void setup_i2s_driver() {
 
     uint16_t dma_buf_len = (currentBufferSize > 512) ? 512 : currentBufferSize;
 
+#if defined(MIC_TYPE_PDM)
+    // PDM microphone configuration (e.g., XIAO ESP32-S3 Sense built-in mic)
+    // PDM outputs 16-bit samples directly - no shift bits needed
+    i2s_config_t i2s_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM),
+        .sample_rate = currentSampleRate,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = I2S_DMA_BUF_COUNT,
+        .dma_buf_len = dma_buf_len,
+    };
+
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = I2S_PIN_NO_CHANGE,
+        .ws_io_num = PDM_CLK_PIN,           // PDM Clock
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = PDM_DATA_PIN         // PDM Data
+    };
+
+    i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+    i2s_set_pin(I2S_NUM_0, &pin_config);
+
+    simplePrintln("I2S (PDM) ready: " + String(currentSampleRate) + "Hz, gain " +
+                  String(currentGainFactor, 1) + ", buffer " + String(currentBufferSize) +
+                  ", DMA " + String(I2S_DMA_BUF_COUNT) + "x" + String(dma_buf_len));
+#else
+    // Standard I2S microphone configuration (ICS-43434, INMP441)
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
         .sample_rate = currentSampleRate,
@@ -596,7 +692,7 @@ void setup_i2s_driver() {
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 8,
+        .dma_buf_count = I2S_DMA_BUF_COUNT,  // Platform-specific buffer count
         .dma_buf_len = dma_buf_len,
     };
 
@@ -613,7 +709,9 @@ void setup_i2s_driver() {
     // (5) log i2sShiftBits for easier debugging
     simplePrintln("I2S ready: " + String(currentSampleRate) + "Hz, gain " +
                   String(currentGainFactor, 1) + ", buffer " + String(currentBufferSize) +
-                  ", shiftBits " + String(i2sShiftBits));
+                  ", shiftBits " + String(i2sShiftBits) + 
+                  ", DMA " + String(I2S_DMA_BUF_COUNT) + "x" + String(dma_buf_len));
+#endif
 }
 
 static bool writeAll(WiFiClient &client, const uint8_t* data, size_t len) {
@@ -679,6 +777,53 @@ void streamAudio(WiFiClient &client) {
     if (!isStreaming || !client.connected()) return;
 
     size_t bytesRead = 0;
+
+#if defined(MIC_TYPE_PDM)
+    // PDM: Read 16-bit samples directly (no 32-bit conversion needed)
+    esp_err_t result = i2s_read(I2S_NUM_0, i2s_16bit_buffer,
+                                currentBufferSize * sizeof(int16_t),
+                                &bytesRead, 50 / portTICK_PERIOD_MS);
+
+    if (result == ESP_OK && bytesRead > 0) {
+        int samplesRead = bytesRead / sizeof(int16_t);
+
+        // If HPF params changed dynamically, recompute
+        if (highpassEnabled && (hpfConfigSampleRate != currentSampleRate || hpfConfigCutoff != highpassCutoffHz)) {
+            updateHighpassCoeffs();
+        }
+
+        bool clipped = false;
+        float peakAbs = 0.0f;
+        for (int i = 0; i < samplesRead; i++) {
+            // PDM outputs 16-bit samples directly - no shift needed
+            float sample = (float)i2s_16bit_buffer[i];
+            if (highpassEnabled) sample = hpf.process(sample);
+            float amplified = sample * currentGainFactor;
+            float aabs = fabsf(amplified);
+            if (aabs > peakAbs) peakAbs = aabs;
+            if (aabs > 32767.0f) clipped = true;
+            if (amplified > 32767.0f) amplified = 32767.0f;
+            if (amplified < -32768.0f) amplified = -32768.0f;
+            i2s_16bit_buffer[i] = (int16_t)amplified;
+        }
+        // Update metering after processing the block
+        if (peakAbs > 32767.0f) peakAbs = 32767.0f;
+        lastPeakAbs16 = (uint16_t)peakAbs;
+        audioClippedLastBlock = clipped;
+        if (clipped) audioClipCount++;
+
+        // Update peak hold for a short window (~3 s) to match UI polling cadence
+        if (lastPeakAbs16 > peakHoldAbs16) {
+            peakHoldAbs16 = lastPeakAbs16;
+            peakHoldUntilMs = millis() + 3000UL;
+        } else if (peakHoldAbs16 > 0 && millis() > peakHoldUntilMs) {
+            peakHoldAbs16 = 0;
+        }
+
+        sendRTPPacket(client, i2s_16bit_buffer, samplesRead);
+    }
+#else
+    // Standard I2S: Read 32-bit samples, convert to 16-bit
     esp_err_t result = i2s_read(I2S_NUM_0, i2s_32bit_buffer,
                                 currentBufferSize * sizeof(int32_t),
                                 &bytesRead, 50 / portTICK_PERIOD_MS);
@@ -720,6 +865,7 @@ void streamAudio(WiFiClient &client) {
 
         sendRTPPacket(client, i2s_16bit_buffer, samplesRead);
     }
+#endif
 }
 
 // RTSP handling
@@ -832,31 +978,57 @@ void setup() {
     Serial.begin(115200);
     delay(100);
 
+    // Platform and version info
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("  ESP32 RTSP Mic for BirdNET-Go");
+    Serial.println("  Platform: " PLATFORM_NAME);
+    Serial.println("  Microphone: " MIC_NAME);
+    Serial.println("  Firmware: " FW_VERSION);
+    Serial.println("========================================");
+#if defined(MIC_TYPE_PDM)
+    Serial.printf("PDM Pins: CLK=%d, DATA=%d\n", PDM_CLK_PIN, PDM_DATA_PIN);
+#else
+    Serial.printf("I2S Pins: BCLK=%d, LRCLK=%d, DOUT=%d\n", 
+                  I2S_BCLK_PIN, I2S_LRCLK_PIN, I2S_DOUT_PIN);
+#endif
+
     // (4) seed for random(): combination of time and unique MAC
     randomSeed((uint32_t)micros() ^ (uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF));
 
     bootTime = millis(); // Store boot time
     rtpSSRC = (uint32_t)random(1, 0x7FFFFFFF);
 
-    // Enable external antenna (for XIAO ESP32-C6).
-    // NOTE: If you are using a board without the RF switch (or no external antenna), comment out or remove this block.
+    // Enable external antenna (for XIAO ESP32-C6 with RF switch only)
+    #if HAS_RF_SWITCH
     pinMode(3, OUTPUT);
     digitalWrite(3, LOW);
     Serial.println("RF switch control enabled (GPIO3 LOW)");
     pinMode(14, OUTPUT);
     digitalWrite(14, HIGH);
     Serial.println("External antenna selected (GPIO14 HIGH)");
+    #endif
 
     // Load settings from flash
     loadAudioSettings();
 
     // Allocate buffers with current size
+#if defined(MIC_TYPE_PDM)
+    // PDM mode: only 16-bit buffer needed
+    i2s_16bit_buffer = (int16_t*)malloc(currentBufferSize * sizeof(int16_t));
+    if (!i2s_16bit_buffer) {
+        simplePrintln("FATAL: Memory allocation failed!");
+        ESP.restart();
+    }
+#else
+    // Standard I2S: both 32-bit and 16-bit buffers
     i2s_32bit_buffer = (int32_t*)malloc(currentBufferSize * sizeof(int32_t));
     i2s_16bit_buffer = (int16_t*)malloc(currentBufferSize * sizeof(int16_t));
     if (!i2s_32bit_buffer || !i2s_16bit_buffer) {
         simplePrintln("FATAL: Memory allocation failed!");
         ESP.restart();
     }
+#endif
 
     // WiFi optimization for stable streaming
     WiFi.setSleep(false);

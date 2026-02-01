@@ -1,5 +1,7 @@
 # Changelog
 
+## in progress - more targets via platformio
+
 ## 1.3.0 — 2025-09-09
 - Thermal protection: added configurable shutdown limit (30–95 °C, default 80 °C) with protection enabled by default.
 - Thermal latch now persists across reboots and must be acknowledged in the Web UI before RTSP can be re-enabled; UI includes clear button and richer status strings.
